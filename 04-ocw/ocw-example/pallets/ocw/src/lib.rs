@@ -321,7 +321,7 @@ pub mod pallet {
 					let _ = prices.pop_front();
 				}
 				prices.push_back(price);
-				log::info!("Number vector: {:?}", prices);
+				log::info!("Prices vector: {:?}", prices);
 			});
 		}
 
@@ -361,7 +361,7 @@ pub mod pallet {
 			log::info!("split[1]: {}", split[1]);
 
 			let left = split[0].parse::<u64>().unwrap();
-			let right = split[1].parse::<u64>().unwrap();
+			let right = (&split[1][0..6]).parse::<u32>().unwrap();
 
 			let number = (left, Permill::from_parts(right as u32));
 			

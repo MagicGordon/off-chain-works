@@ -44,12 +44,14 @@ pub mod pallet {
 	/// The keys can be inserted manually via RPC (see `author_insertKey`).
 	pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"demo");
 	const NUM_VEC_LEN: usize = 10;
+	const PRICE_VEC_LEN: usize = 10;
 	/// The type to sign and send transactions.
 	const UNSIGNED_TXS_PRIORITY: u64 = 100;
 
 	// We are fetching information from the github public API about organization`substrate-developer-hub`.
 	const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
 	const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
+	const HTTP_PRICE_REQUEST: &str = "https://api.coincap.io/v2/assets/polkadot";
 
 	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 	const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
@@ -107,6 +109,17 @@ pub mod pallet {
 		public_repos: u32,
 	}
 
+	#[derive(Deserialize, Encode, Decode, Default)]
+	struct Data {
+		#[serde(deserialize_with = "de_string_to_bytes")]
+		priceUsd: Vec<u8>,
+	}
+
+	#[derive(Deserialize, Encode, Decode, Default)]
+	struct DotPricesInfo {
+		data: Data
+	}
+
 	#[derive(Debug, Deserialize, Encode, Decode, Default)]
 	struct IndexingData(Vec<u8>, u64);
 
@@ -162,6 +175,7 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		NewNumber(Option<T::AccountId>, u64),
+		NewPrice(Option<T::AccountId>, (u64, Permill)),
 	}
 
 	// Errors inform users that something went wrong.
@@ -288,9 +302,29 @@ pub mod pallet {
 			Self::deposit_event(Event::NewNumber(None, number));
 			Ok(())
 		}
+
+		#[pallet::weight(10000)]
+		pub fn submit_prices(origin: OriginFor<T>, price: (u64, Permill)) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			log::info!("submit_prices: ({:?}, {:?})", price, who);
+			Self::append_or_replace_prices(price);
+
+			Self::deposit_event(Event::NewPrice(Some(who), price));
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
+		fn append_or_replace_prices(price: (u64, Permill)) {
+			Prices::<T>::mutate(|prices| {
+				if prices.len() == PRICE_VEC_LEN {
+					let _ = prices.pop_front();
+				}
+				prices.push_back(price);
+				log::info!("Number vector: {:?}", prices);
+			});
+		}
+
 		/// Append a new number to the tail of the list, removing an element from the head if reaching
 		///   the bounded length.
 		fn append_or_replace_number(number: u64) {
@@ -306,18 +340,97 @@ pub mod pallet {
 		fn fetch_price_info() -> Result<(), Error<T>> {
 			// TODO: 这是你们的功课
 
+			//本次使用签名交易，这种方式最安全
+
 			// 利用 offchain worker 取出 DOT 当前对 USD 的价格，并把写到一个 Vec 的存储里，
 			// 你们自己选一种方法提交回链上，并在代码注释为什么用这种方法提交回链上最好。只保留当前最近的 10 个价格，
 			// 其他价格可丢弃 （就是 Vec 的长度长到 10 后，这时再插入一个值时，要先丢弃最早的那个值）。
+			let signer = Signer::<T, T::AuthorityId>::any_account();
 
+			
+			let dpi_info = match Self::fetch_price() {
+				Ok(r) => r,
+				Err(err) => { return Err(err); }
+			};
+			
+			let p: &str = str::from_utf8(&dpi_info.data.priceUsd).unwrap();
+
+			let split: Vec<&str> = p.split('.').collect();
+
+			log::info!("split[0]: {}", split[0]);
+			log::info!("split[1]: {}", split[1]);
+
+			let left = split[0].parse::<u64>().unwrap();
+			let right = split[1].parse::<u64>().unwrap();
+
+			let number = (left, Permill::from_parts(right as u32));
+			
 			// 取得的价格 parse 完后，放在以下存儲：
 			// pub type Prices<T> = StorageValue<_, VecDeque<(u64, Permill)>, ValueQuery>
+			let result = signer.send_signed_transaction(|_acct|
+				// This is the on-chain function
+				Call::submit_prices(number)
+				);
 
+			// Display error if the signed tx fails.
+			if let Some((acc, res)) = result {
+				if res.is_err() {
+					log::error!("failure: offchain_signed_tx: tx sent: {:?}", acc.id);
+					return Err(<Error<T>>::OffchainSignedTxError);
+				}
+				// Transaction is sent successfully
+				return Ok(());
+			};
+
+			// The case of `None`: no account is available for sending
+			log::error!("No local account available");
+			Err(<Error<T>>::NoLocalAcctForSigning)
 			// 这个 http 请求可得到当前 DOT 价格：
 			// [https://api.coincap.io/v2/assets/polkadot](https://api.coincap.io/v2/assets/polkadot)。
 
-			Ok(())
+			// Ok(())
 		}
+
+		fn fetch_price() -> Result<DotPricesInfo, Error<T>> {
+			log::info!("sending request to: {}", HTTP_PRICE_REQUEST);
+
+			// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
+			let request = rt_offchain::http::Request::get(HTTP_PRICE_REQUEST);
+
+			// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
+			let timeout = sp_io::offchain::timestamp()
+			.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+
+			// For github API request, we also need to specify `user-agent` in http request header.
+			//   See: https://developer.github.com/v3/#user-agent-required
+			let pending = request
+			.add_header("User-Agent", HTTP_HEADER_USER_AGENT)
+				.deadline(timeout) // Setting the timeout time
+				.send() // Sending the request out by the host
+				.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			let response = pending
+			.try_wait(timeout)
+			.map_err(|_| <Error<T>>::HttpFetchingError)?
+			.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			if response.code != 200 {
+				log::error!("Unexpected http request status code: {}", response.code);
+				return Err(<Error<T>>::HttpFetchingError);
+			}
+
+			
+			let resp_bytes = response.body().collect::<Vec<u8>>();
+			let resp_str = str::from_utf8(&resp_bytes).map_err(|_| <Error<T>>::HttpFetchingError)?;
+			// Print out our fetched JSON string
+			log::info!("{}", resp_str);
+
+			// Deserializing JSON to struct, thanks to `serde` and `serde_derive`
+			let dpi_info: DotPricesInfo =
+			serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
+			Ok(dpi_info)
+		}
+
 
 
 		/// Check if we have fetched github info before. If yes, we can use the cached version
